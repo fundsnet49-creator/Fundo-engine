@@ -7,7 +7,7 @@
  *
  *   POST  body {"sms": "..."}                     -> parse alert, match, approve
  *   GET   ?sweep=1                                -> withdrawal autopilot + auto-decline
- *   GET   ?ping=1&key=KEY                         -> self-test
+ *   GET   ?ping=1&key=KEY                         -> self-test + recentAlerts (what the engine received)
  *   GET   ?ping=1&key=KEY&approve=6500&name=Chidi -> force-approve a stuck order by name
  * Header x-autopilot-key: <HOOK_KEY> required on every call.
  */
@@ -336,6 +336,8 @@ exports.handler = async (event) => {
       diag.pendingFndOrders = t.size
       diag.samplePendingAmounts = t.docs.map(d => Number(d.data().amount) || 0)
       diag.sampleNotes = t.docs.map(d => String(d.data().ref || d.data().note || ''))
+      const b = await db.collection('bankAlerts').orderBy('createdAt', 'desc').limit(3).get()
+      diag.recentAlerts = b.docs.map(d => { const x = d.data(); return { amount: x.amount, name: x.name, whenMs: x.whenMs } })
       if (params.approve) {
         const dbg = { steps: [] }
         const alert = { amount: Number(params.approve), name: String(params.name || ''), whenMs: params.when ? Number(params.when) : 0, credit: true }
