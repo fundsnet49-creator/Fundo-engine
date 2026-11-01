@@ -248,6 +248,7 @@ exports.handler = async (event) => {
     try {
       init()
       diag.firebaseInit = 'ok'
+      diag.config = await getAutopilotConfig()
       await db.doc('settings/autopilot').get()
       diag.firestoreRead = 'ok'
       const t = await db.collection('fndOrders').where('status', '==', 'pending').limit(5).get()
