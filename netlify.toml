@@ -1,0 +1,7 @@
+# FUNDO Engine — Netlify config
+# The scheduled sweep makes the WITHDRAWAL AUTOPILOT run every minute with no
+# phone involved. If your repo already has a netlify.toml, copy ONLY the
+# [functions."sweep"] block into it.
+
+[functions."sweep"]
+  schedule = "* * * * *"
