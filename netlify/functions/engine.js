@@ -248,7 +248,16 @@ async function approveMatch(alert, options = {}) {
           } else if (kind === 'verify') {
             tx.update(userRef, { bankVerified: true, balance: admin.firestore.FieldValue.increment(Number(data.amount) - VERIFY_CHARGE) })
           } else if (kind === 'upgrade') {
-            tx.update(userRef, { miningTier: data.tier || 'free' })
+            // Plan duration: stamp when the paid plan lapses. Read the plan
+            // doc's durationMonths (1/2/3 months, or 0/absent = lifetime) and
+            // set planExpiresAt accordingly — the app downgrades the account
+            // to Free once it passes.
+            let months = 0
+            try {
+              const planSnap = await tx.get(db.collection('plans').doc(String(data.tier || 'free')))
+              if (planSnap.exists) months = Math.floor(Number(planSnap.data().durationMonths) || 0)
+            } catch (e) { /* plan doc missing — treat as lifetime */ }
+            tx.update(userRef, { miningTier: data.tier || 'free', planExpiresAt: months > 0 ? Math.round(Date.now() + months * 30.44 * 86400000) : null })
           }
         })
       } catch (e) {
