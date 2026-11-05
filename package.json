@@ -1,9 +1,0 @@
-{
-  "name": "fundo-engine-netlify",
-  "version": "1.0.0",
-  "private": true,
-  "description": "FUNDO payment matching engine for Netlify Functions (no Blaze required)",
-  "dependencies": {
-    "firebase-admin": "^12.6.0"
-  }
-}
