@@ -1,5 +1,5 @@
 /**
- * FUNDO Autopilot Engine — v5 (Netlify Function)
+ * FUNDO Autopilot Engine — v6.2 (Netlify Function)
  *
  * ONE endpoint does everything:  https://<your-site>.netlify.app/.netlify/functions/engine
  *
@@ -10,14 +10,22 @@
  *
  * Every call (except OPTIONS) needs the HOOK_KEY: header  x-autopilot-key: <key>  or ?key=<key>.
  *
- * v5 changes vs v4:
- *  - Withdrawal autopilot honours settings/withdrawAutopilot.delaySeconds (default 30):
- *    a pending withdrawal is only processed once it is at least that many seconds old,
- *    so auto-decline can wait e.g. 30s after the user places the withdrawal.
- *  - sweep=1 returns a full per-run summary (processed / skipped-too-fresh / mode / delay).
+ * v6.2 changes vs v6.1 — smarter payment matching (FND / verify / upgrade):
+ *  - The alert's RECEIVER name ("To: NAME" / "credited to NAME") is now parsed and
+ *    matched against the order owner's linked-account / profile names. Chain:
+ *      1. sender name vs order ref/note
+ *      2. receiver name vs linked account / profile name   ← NEW
+ *      3. sender name vs profile name
+ *      4. amount + time window
+ *  - AMOUNT-DIFFERENCE RESCUE (NEW): if no pending order matches the alert amount
+ *    exactly (bank fees shave credits), a strong name match (receiver or sender)
+ *    + valid time window approves the closest-amount pending order instead of
+ *    letting it auto-decline. The approval log records the exact difference.
  *
- * Trigger the sweep from your Android app (Sketchware) with a Timer component:
- *  Timer interval 60000 ms, on timer: HTTP GET  <endpoint>?sweep=1   header x-autopilot-key.
+ * v6/v5 changes:
+ *  - Withdrawal autopilot honours settings/withdrawAutopilot.delaySeconds (default 30).
+ *  - Upgrade approvals stamp planExpiresAt from the plan's durationMonths.
+ *  - sweep=1 returns a full per-run summary.
  */
 
 const admin = require('firebase-admin')
@@ -99,6 +107,17 @@ function parseName(text) {
   return (cut ? m[1].slice(0, cut.index) : m[1]).trim()
 }
 
+// "To: JOHN CHIDI OBIANO" / "credited to JOHN OBIANO" / "paid into JOHN OBIANO's account"
+// → receiver name (the FUNDO account the buyer deposited into)
+function parseReceiver(text) {
+  if (!text) return ''
+  let m = /\bto:\s*([A-Za-z][A-Za-z .,'-]{2,60})/i.exec(text)
+  if (!m) m = /(?:credited|paid|transferred)\s+(?:to|into)\s+([A-Za-z][A-Za-z .,'-]{2,60})/i.exec(text)
+  if (!m) return ''
+  const cut = /\b(desc|description|ref|reference|when|bal|balance|date|narration|time|via|from|amt|amount)\b/i.exec(m[1])
+  return (cut ? m[1].slice(0, cut.index) : m[1]).trim()
+}
+
 // "When: 02/11/26 14:35" (DD/MM/YY[YY]) → epoch ms
 function parseWhen(text) {
   if (!text) return 0
@@ -112,7 +131,7 @@ function parseWhen(text) {
 }
 
 function parseAlert(text) {
-  return { amount: parseAmount(text), name: parseName(text), whenMs: parseWhen(text), text: String(text || '').slice(0, 500) }
+  return { amount: parseAmount(text), name: parseName(text), receiver: parseReceiver(text), whenMs: parseWhen(text), text: String(text || '').slice(0, 500) }
 }
 
 /* ------------------------------ name match -------------------------------- */
@@ -140,6 +159,13 @@ function profileNames(user) {
     if (user[k]) out.push(String(user[k]))
   }
   if (user.firstName && user.lastName) out.push(`${user.firstName} ${user.lastName}`)
+  // linked account stored as a nested object (verify page / app variants)
+  const la = user.linkedAccount
+  if (la && typeof la === 'object') {
+    for (const k of ['accountName', 'holderName', 'name', 'fullName']) {
+      if (la[k]) out.push(String(la[k]))
+    }
+  }
   return out
 }
 
@@ -209,20 +235,38 @@ async function approveMatch(alert, options = {}) {
   const now = Date.now()
   for (const [kind, meta] of Object.entries(KINDS)) {
     if (!config[kind] && !force) continue
-    let q = db.collection(meta.collection).where('status', '==', 'pending')
-    if (!force) q = q.where('amount', '==', alert.amount)
-    q = q.orderBy('createdAt', 'asc').limit(10)
-    const pending = await q.get()
-    if (pending.empty) continue
-    for (const doc of pending.docs) {
+
+    // Pass 1: pending orders with the EXACT alert amount.
+    // Pass 2 (rescue): no exact-amount order exists and the alert carries a name
+    //   → look across ALL pending amounts; a strong name match + time window
+    //     approves the closest amount (handles bank fees shaving the credit).
+    let pendingSnap = null
+    let exactAmount = true
+    {
+      let q = db.collection(meta.collection).where('status', '==', 'pending')
+      if (!force) q = q.where('amount', '==', alert.amount)
+      q = q.orderBy('createdAt', 'asc').limit(10)
+      pendingSnap = await q.get()
+    }
+    if (!force && pendingSnap.empty && (alert.name || alert.receiver)) {
+      exactAmount = false
+      debug.push(`${kind}: no pending order at exactly ${naira(alert.amount)} — trying name match across amounts`)
+      pendingSnap = await db.collection(meta.collection).where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(10).get()
+    }
+    if (pendingSnap.empty) continue
+
+    const candidates = []
+    for (const doc of pendingSnap.docs) {
       const data = doc.data()
       const createdMs = createdMsOf(data)
       const selfName = data.ref || data.note || ''
-      const nmSelf = alert.name && nameMatches(alert.name, selfName)
-      let nmProfile = false
+      const nmSelf = Boolean(alert.name) && nameMatches(alert.name, selfName)
+      let nmProfile = false, nmLinked = false
       try {
         const userSnap = await db.collection('users').doc(data.uid).get()
-        nmProfile = alert.name && profileNames(userSnap.data()).some(p => nameMatches(alert.name, p))
+        const pnames = profileNames(userSnap.data())
+        nmProfile = Boolean(alert.name) && pnames.some(p => nameMatches(alert.name, p))
+        nmLinked = Boolean(alert.receiver) && pnames.some(p => nameMatches(alert.receiver, p))
       } catch (e) { /* user lookup failed — treat as no profile match */ }
       let timeOk, timediff = null
       if (alert.whenMs) {
@@ -231,10 +275,37 @@ async function approveMatch(alert, options = {}) {
       } else {
         timeOk = now - createdMs <= MATCH_WINDOW_MS
       }
-      const via = nmSelf ? 'sender name from order' : nmProfile ? 'account name' : timeOk ? 'amount+time' : null
-      debug.push(`${kind}: order ${data.ref || data.note || data.uid} | sender-name=${nmSelf ? 'MATCH' : 'no'} | profile-name=${nmProfile ? 'MATCH' : 'no'} | timediff=${timediff === null ? 'n/a' : Math.round(timediff / 1000) + 's'} | timeOk=${timeOk}`)
+      const anyName = nmSelf || nmLinked || nmProfile
+      // Rescue-mode guard: the amount is wrong by design (fees), but only within
+      // reason — beyond fee tolerance the alert is NOT for this order.
+      const diff = Math.abs((Number(data.amount) || 0) - alert.amount)
+      const feeTol = Math.max(500, Math.round((alert.amount || 0) * 0.1))
+      if (!exactAmount && diff > feeTol) {
+        debug.push(`${kind}: order ${data.ref || data.note || data.uid} | amount differs by ${naira(diff)} — beyond ${naira(feeTol)} fee tolerance, skipped`)
+        continue
+      }
+      // In rescue mode a name match + time window is mandatory (amount is unreliable).
+      let via = nmSelf ? 'sender name from order'
+        : nmLinked ? 'receiver name = linked account'
+        : nmProfile ? 'sender name = account name'
+        : timeOk && exactAmount ? 'amount+time'
+        : !exactAmount && anyName && timeOk ? 'name+time' : null
+      if (!exactAmount && via) via = `${via} (amount differs by ${naira(diff)}, within ${naira(feeTol)} fee tolerance)`
+      debug.push(`${kind}: order ${data.ref || data.note || data.uid} | sender=${nmSelf ? 'MATCH' : 'no'} | receiver-linked=${nmLinked ? 'MATCH' : 'no'} | profile=${nmProfile ? 'MATCH' : 'no'} | timediff=${timediff === null ? 'n/a' : Math.round(timediff / 1000) + 's'} | timeOk=${timeOk}`)
       if (!via && !(force && !alert.name)) continue // no clue matched — leave it for the next alert
       // force approve with no name: take the oldest pending of this amount regardless of time
+      candidates.push({ doc, data, via })
+    }
+    if (!candidates.length) continue
+    // rescue mode: among the name-matched orders pick the amount closest to the alert
+    const pick = exactAmount
+      ? candidates[0]
+      : candidates.reduce((a, b) => Math.abs((Number(a.data.amount) || 0) - alert.amount) <= Math.abs((Number(b.data.amount) || 0) - alert.amount) ? a : b)
+
+    {
+      const doc = pick.doc
+      const data = pick.data
+      const via = pick.via
 
       const userRef = db.collection('users').doc(data.uid)
       try {
@@ -408,13 +479,13 @@ exports.handler = async (event) => {
         pendingFndOrders: pendingFnd.size,
         samplePendingAmounts: pendingFnd.docs.map(d => Number(d.data().amount) || 0),
         sampleNotes: pendingFnd.docs.map(d => String(d.data().ref || d.data().note || '')),
-        recentAlerts: alertsSnap.docs.map(d => { const a = d.data(); return { amount: a.amount, name: a.name || '', whenMs: a.whenMs || 0, at: a.createdAt && a.createdAt.toMillis ? new Date(a.createdAt.toMillis()).toISOString() : '' } }),
+        recentAlerts: alertsSnap.docs.map(d => { const a = d.data(); return { amount: a.amount, name: a.name || '', receiver: a.receiver || '', whenMs: a.whenMs || 0, at: a.createdAt && a.createdAt.toMillis ? new Date(a.createdAt.toMillis()).toISOString() : '' } }),
       }
       if (params.approve) {
-        const alert = { amount: Number(params.approve) || 0, name: String(params.name || ''), whenMs: 0 }
+        const alert = { amount: Number(params.approve) || 0, name: String(params.name || ''), receiver: String(params.receiver || ''), whenMs: 0 }
         const debug = []
         const match = await approveMatch(alert, { force: true, debug })
-        diag.testApprove = { requestedAmount: alert.amount, name: alert.name || null, result: match, debug }
+        diag.testApprove = { requestedAmount: alert.amount, name: alert.name || null, receiver: alert.receiver || null, result: match, debug }
       }
       return json(200, diag)
     }
@@ -428,7 +499,7 @@ exports.handler = async (event) => {
 
     /* ---- force approve (test tool): ?approve=AMOUNT&name=NAME ---- */
     if (params.approve) {
-      const alert = { amount: Number(params.approve) || 0, name: String(params.name || ''), whenMs: 0 }
+      const alert = { amount: Number(params.approve) || 0, name: String(params.name || ''), receiver: String(params.receiver || ''), whenMs: 0 }
       const debug = []
       const match = await approveMatch(alert, { force: true, debug })
       return json(200, { ok: true, forced: true, match, debug })
