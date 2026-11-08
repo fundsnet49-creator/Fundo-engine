@@ -1,5 +1,5 @@
 /**
- * FUNDO Autopilot Engine — v6.3 (Netlify Function)
+ * FUNDO Autopilot Engine — v6.4 (Netlify Function)
  *
  * ONE endpoint does everything:  https://<your-site>.netlify.app/.netlify/functions/engine
  *
@@ -9,6 +9,16 @@
  *  GET  ?approve=AMOUNT&name=NAME&key=KEY     → force-approve one pending order (test tool)
  *
  * Every call (except OPTIONS) needs the HOOK_KEY: header  x-autopilot-key: <key>  or ?key=<key>.
+ *
+ * v6.4 changes vs v6.3 — timezone-safe time matching:
+ *  - Sparkle stamps "When" in NIGERIA time (WAT, UTC+1); the server runs UTC.
+ *    Even after the 12-hour-clock repair the stamp sits ~1h off the server
+ *    clock, so comparing it to the order timestamp with ±10min failed every
+ *    payment that relied on amount+time. The stamp is now only compared to
+ *    the SMS ARRIVAL time (±3h sanity bound): the message arriving IS the
+ *    proof the deposit just happened. Order freshness is judged by the
+ *    order's own age (< MATCH_WINDOW 45min, and in practice < windowMinutes
+ *    because auto-decline kills anything older).
  *
  * v6.3 changes vs v6.2 — Sparkle format fixes:
  *  - Sparkle "When" is 12-hour clock without AM/PM (a 3:48 PM deposit is
@@ -77,10 +87,11 @@ const KINDS = {
   upgrade: { collection: 'upgradeRequests', label: 'Upgrade deposit' },
 }
 const VERIFY_CHARGE = 200
-const MATCH_WINDOW_MS = 45 * 60 * 1000   // no "When" in the SMS → order must be younger than this
-const TIME_MATCH_MS = 10 * 60 * 1000     // SMS "When" within ±10 min of the order time. A pending order
-                                         // can never outlive the auto-decline window (windowMinutes),
-                                         // so 10 min is safe: still-pending ⇒ inside the window.
+const MATCH_WINDOW_MS = 45 * 60 * 1000   // no usable "When" in the SMS → order must be younger than this
+const WHEN_SANE_MS = 3 * 60 * 60 * 1000  // bank "When" stamps are in the BANK's timezone (Sparkle = WAT,
+                                         // server = UTC), so the stamp is only trusted as "the deposit
+                                         // just happened" when it lands within ±3h of the SMS arriving.
+                                         // Never compared directly to the server clock.
 
 /* ------------------------------- parsing ---------------------------------- */
 
@@ -290,10 +301,13 @@ async function approveMatch(alert, options = {}) {
         nmProfile = Boolean(alert.name) && pnames.some(p => nameMatches(alert.name, p))
         nmLinked = Boolean(alert.receiver) && pnames.some(p => nameMatches(alert.receiver, p))
       } catch (e) { /* user lookup failed — treat as no profile match */ }
+      // Time evidence: the SMS arriving NOW is the anchor, not the server clock.
+      // The order must still be fresh, and the bank stamp (already 12h-repaired)
+      // must be plausibly "just now" within ±3h — after that it's an old payment.
       let timeOk, timediff = null
       if (alert.whenMs) {
-        timediff = alert.whenMs - createdMs
-        timeOk = Math.abs(timediff) <= TIME_MATCH_MS
+        timediff = alert.whenMs - now
+        timeOk = (now - createdMs) <= MATCH_WINDOW_MS && Math.abs(timediff) <= WHEN_SANE_MS
       } else {
         timeOk = now - createdMs <= MATCH_WINDOW_MS
       }
@@ -313,7 +327,7 @@ async function approveMatch(alert, options = {}) {
         : timeOk && exactAmount ? 'amount+time'
         : !exactAmount && anyName && timeOk ? 'name+time' : null
       if (!exactAmount && via) via = `${via} (amount differs by ${naira(diff)}, within ${naira(feeTol)} fee tolerance)`
-      debug.push(`${kind}: order ${data.ref || data.note || data.uid} | sender=${nmSelf ? 'MATCH' : 'no'} | receiver-linked=${nmLinked ? 'MATCH' : 'no'} | profile=${nmProfile ? 'MATCH' : 'no'} | timediff=${timediff === null ? 'n/a' : Math.round(timediff / 1000) + 's'} | timeOk=${timeOk}`)
+      debug.push(`${kind}: order ${data.ref || data.note || data.uid} | sender=${nmSelf ? 'MATCH' : 'no'} | receiver-linked=${nmLinked ? 'MATCH' : 'no'} | profile=${nmProfile ? 'MATCH' : 'no'} | when-vs-arrival=${timediff === null ? 'n/a' : Math.round(timediff / 1000) + 's'} | orderAge=${Math.round((now - createdMs) / 1000) + 's'} | timeOk=${timeOk}`)
       if (!via && !(force && !alert.name)) continue // no clue matched — leave it for the next alert
       // force approve with no name: take the oldest pending of this amount regardless of time
       candidates.push({ doc, data, via })
@@ -496,7 +510,7 @@ exports.handler = async (event) => {
         db.collection('bankAlerts').orderBy('createdAt', 'desc').limit(5).get(),
       ])
       const diag = {
-        ok: true, engine: 'v6.3', now: new Date().toISOString(), auth,
+        ok: true, engine: 'v6.4', now: new Date().toISOString(), auth,
         config, withdrawAutopilot: withdraw,
         pendingFndOrders: pendingFnd.size,
         samplePendingAmounts: pendingFnd.docs.map(d => Number(d.data().amount) || 0),
@@ -516,7 +530,7 @@ exports.handler = async (event) => {
     if (params.sweep === '1') {
       const withdrawals = await sweepWithdrawals()
       const stale = await autoDeclineStale()
-      return json(200, { ok: true, engine: 'v6.3', withdrawals, staleDeclined: stale })
+      return json(200, { ok: true, engine: 'v6.4', withdrawals, staleDeclined: stale })
     }
 
     /* ---- force approve (test tool): ?approve=AMOUNT&name=NAME ---- */
