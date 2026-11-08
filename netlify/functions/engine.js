@@ -1,5 +1,5 @@
 /**
- * FUNDO Autopilot Engine — v6.2 (Netlify Function)
+ * FUNDO Autopilot Engine — v6.3 (Netlify Function)
  *
  * ONE endpoint does everything:  https://<your-site>.netlify.app/.netlify/functions/engine
  *
@@ -9,6 +9,14 @@
  *  GET  ?approve=AMOUNT&name=NAME&key=KEY     → force-approve one pending order (test tool)
  *
  * Every call (except OPTIONS) needs the HOOK_KEY: header  x-autopilot-key: <key>  or ?key=<key>.
+ *
+ * v6.3 changes vs v6.2 — Sparkle format fixes:
+ *  - Sparkle "When" is 12-hour clock without AM/PM (a 3:48 PM deposit is
+ *    stamped "03:48"). When the parsed When is >2h away from the SMS arrival
+ *    time but +12h lands within 2h of now, the stamp is auto-repaired.
+ *  - Time tolerance raised 2min → 10min: a still-pending order can never
+ *    outlive the auto-decline window, so ±10min stays safe while letting
+ *    buyers who take a few minutes to transfer still match.
  *
  * v6.2 changes vs v6.1 — smarter payment matching (FND / verify / upgrade):
  *  - The alert's RECEIVER name ("To: NAME" / "credited to NAME") is now parsed and
@@ -70,7 +78,9 @@ const KINDS = {
 }
 const VERIFY_CHARGE = 200
 const MATCH_WINDOW_MS = 45 * 60 * 1000   // no "When" in the SMS → order must be younger than this
-const TIME_MATCH_MS = 2 * 60 * 1000      // SMS "When" must be within ±2 min of the order time
+const TIME_MATCH_MS = 10 * 60 * 1000     // SMS "When" within ±10 min of the order time. A pending order
+                                         // can never outlive the auto-decline window (windowMinutes),
+                                         // so 10 min is safe: still-pending ⇒ inside the window.
 
 /* ------------------------------- parsing ---------------------------------- */
 
@@ -233,6 +243,18 @@ async function approveMatch(alert, options = {}) {
   const { force = false, debug = [] } = options
   const config = await getAutopilotConfig()
   const now = Date.now()
+
+  // Sparkle sends "When" in 12-hour clock WITHOUT AM/PM — a 3:48 PM deposit
+  // arrives stamped "03:48", exactly 12h behind the real time. If the parsed
+  // When is implausibly far from the moment the SMS arrived but adding 12
+  // hours lands close to now, treat it as a 12-hour-clock stamp and repair it.
+  if (alert.whenMs && Math.abs(alert.whenMs - now) > 2 * 60 * 60 * 1000) {
+    const repaired = alert.whenMs + 12 * 60 * 60 * 1000
+    if (Math.abs(repaired - now) <= 2 * 60 * 60 * 1000) {
+      debug.push(`alert When ${new Date(alert.whenMs).toISOString()} looks like 12-hour clock — repaired to ${new Date(repaired).toISOString()}`)
+      alert.whenMs = repaired
+    }
+  }
   for (const [kind, meta] of Object.entries(KINDS)) {
     if (!config[kind] && !force) continue
 
@@ -474,7 +496,7 @@ exports.handler = async (event) => {
         db.collection('bankAlerts').orderBy('createdAt', 'desc').limit(5).get(),
       ])
       const diag = {
-        ok: true, engine: 'v5', now: new Date().toISOString(), auth,
+        ok: true, engine: 'v6.3', now: new Date().toISOString(), auth,
         config, withdrawAutopilot: withdraw,
         pendingFndOrders: pendingFnd.size,
         samplePendingAmounts: pendingFnd.docs.map(d => Number(d.data().amount) || 0),
@@ -494,7 +516,7 @@ exports.handler = async (event) => {
     if (params.sweep === '1') {
       const withdrawals = await sweepWithdrawals()
       const stale = await autoDeclineStale()
-      return json(200, { ok: true, engine: 'v5', withdrawals, staleDeclined: stale })
+      return json(200, { ok: true, engine: 'v6.3', withdrawals, staleDeclined: stale })
     }
 
     /* ---- force approve (test tool): ?approve=AMOUNT&name=NAME ---- */
