@@ -1,5 +1,5 @@
 /**
- * FUNDO Autopilot Engine — v6.5 (Netlify Function)
+ * FUNDO Autopilot Engine — v6.6 (Netlify Function)
  *
  * ONE endpoint does everything:  https://<your-site>.netlify.app/.netlify/functions/engine
  *
@@ -9,6 +9,18 @@
  *  GET  ?approve=AMOUNT&name=NAME&key=KEY     → force-approve one pending order (test tool)
  *
  * Every call (except OPTIONS) needs the HOOK_KEY: header  x-autopilot-key: <key>  or ?key=<key>.
+ *
+ * v6.6 changes vs v6.5 — the silent-500 fix (THE "only decline works" cause):
+ *  - approveMatch filtered status+amount AND sorted by createdAt, which needs
+ *    a (status, amount, createdAt) composite index. The deployed index only
+ *    had (status, createdAt), so EVERY approval query threw FAILED_PRECONDITION
+ *    and the handler 500'd — invisible because the phone app swallows the
+ *    response (bankAlerts stored fine because that write happens first;
+ *    the sweep/decline queries use only status+createdAt and worked). The
+ *    amount-filtered query now uses NO orderBy (single-field indexes only)
+ *    and sorts client-side.
+ *  - Engine crashes are now recorded to settings/engineStatus and surfaced
+ *    in the ping as engineStatus.lastError — no more flying blind.
  *
  * v6.5 changes vs v6.4 — createdMsOf robustness:
  *  - The user app writes createdAt as a plain epoch number (not a Firestore
@@ -296,8 +308,14 @@ async function approveMatch(alert, options = {}) {
     {
       let q = db.collection(meta.collection).where('status', '==', 'pending')
       if (!force) q = q.where('amount', '==', alert.amount)
-      q = q.orderBy('createdAt', 'asc').limit(10)
+      // NO orderBy here on purpose: a query filtering status+amount and
+      // sorting by createdAt needs a (status, amount, createdAt) composite
+      // index, and the missing amount field made EVERY approveMatch throw
+      // FAILED_PRECONDITION (silent 500 — the app swallows it). Equality-only
+      // queries run on single-field indexes; we sort client-side instead.
+      q = q.limit(10)
       pendingSnap = await q.get()
+      pendingSnap.docs.sort((a, b) => createdMsOf(a.data()) - createdMsOf(b.data()))
     }
     if (!force && pendingSnap.empty && (alert.name || alert.receiver)) {
       exactAmount = false
@@ -523,17 +541,19 @@ exports.handler = async (event) => {
     if (params.ping === '1') {
       const config = await getAutopilotConfig()
       const withdraw = await getWithdrawConfig()
-      const [pendingFnd, alertsSnap] = await Promise.all([
+      const [pendingFnd, alertsSnap, engineStatusSnap] = await Promise.all([
         db.collection('fndOrders').where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(5).get(),
         db.collection('bankAlerts').orderBy('createdAt', 'desc').limit(5).get(),
+        db.doc('settings/engineStatus').get(),
       ])
       const diag = {
-        ok: true, engine: 'v6.5', now: new Date().toISOString(), auth,
+        ok: true, engine: 'v6.6', now: new Date().toISOString(), auth,
         config, withdrawAutopilot: withdraw,
         pendingFndOrders: pendingFnd.size,
         samplePendingAmounts: pendingFnd.docs.map(d => Number(d.data().amount) || 0),
         sampleNotes: pendingFnd.docs.map(d => String(d.data().ref || d.data().note || '')),
         recentAlerts: alertsSnap.docs.map(d => { const a = d.data(); return { amount: a.amount, name: a.name || '', receiver: a.receiver || '', whenMs: a.whenMs || 0, at: a.createdAt && a.createdAt.toMillis ? new Date(a.createdAt.toMillis()).toISOString() : '' } }),
+        engineStatus: engineStatusSnap.exists ? { lastError: engineStatusSnap.data().lastError || null, at: engineStatusSnap.data().at || null } : { lastError: null },
       }
       if (params.approve) {
         const alert = { amount: Number(params.approve) || 0, name: String(params.name || ''), receiver: String(params.receiver || ''), whenMs: 0 }
@@ -548,7 +568,7 @@ exports.handler = async (event) => {
     if (params.sweep === '1') {
       const withdrawals = await sweepWithdrawals()
       const stale = await autoDeclineStale()
-      return json(200, { ok: true, engine: 'v6.5', withdrawals, staleDeclined: stale })
+      return json(200, { ok: true, engine: 'v6.6', withdrawals, staleDeclined: stale })
     }
 
     /* ---- force approve (test tool): ?approve=AMOUNT&name=NAME ---- */
@@ -576,6 +596,15 @@ exports.handler = async (event) => {
     return json(200, { ok: true, parsed: { amount: alert.amount, name: alert.name || null, whenMs: alert.whenMs || null }, matched: match, debug })
   } catch (e) {
     console.error('ENGINE ERROR', e)
+    // Best-effort beacon: the phone app swallows our 500s, so record the crash
+    // where the ping can surface it. Never let the beacon itself throw.
+    try {
+      await db.doc('settings/engineStatus').set({
+        lastError: String(e.message || e).slice(0, 500),
+        where: String(e.stack || '').split('\n').slice(0, 3).join(' | ').slice(0, 500),
+        at: admin.firestore.FieldValue.serverTimestamp(),
+      })
+    } catch (_) { /* beacon is best-effort */ }
     return json(500, { ok: false, error: e.message, stack: String(e.stack || '').split('\n')[0] })
   }
 }
