@@ -1,5 +1,5 @@
 /**
- * FUNDO Autopilot Engine — v6.4 (Netlify Function)
+ * FUNDO Autopilot Engine — v6.5 (Netlify Function)
  *
  * ONE endpoint does everything:  https://<your-site>.netlify.app/.netlify/functions/engine
  *
@@ -9,6 +9,13 @@
  *  GET  ?approve=AMOUNT&name=NAME&key=KEY     → force-approve one pending order (test tool)
  *
  * Every call (except OPTIONS) needs the HOOK_KEY: header  x-autopilot-key: <key>  or ?key=<key>.
+ *
+ * v6.5 changes vs v6.4 — createdMsOf robustness:
+ *  - The user app writes createdAt as a plain epoch number (not a Firestore
+ *    Timestamp), so the old .toMillis()-or-now() fallback returned Date.now()
+ *    for every order: auto-decline never saw anything stale (orders sat
+ *    pending forever) and time matching had a garbage anchor. Timestamps,
+ *    epoch ms/s numbers, and ISO strings are now all understood.
  *
  * v6.4 changes vs v6.3 — timezone-safe time matching:
  *  - Sparkle stamps "When" in NIGERIA time (WAT, UTC+1); the server runs UTC.
@@ -245,7 +252,18 @@ function userNotif(uid, title, body, type) {
   }).catch(e => console.error('userNotif failed', e.message))
 }
 
-const createdMsOf = data => (data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : Date.now())
+// The user app writes createdAt as a plain epoch NUMBER (not a Firestore
+// Timestamp), which used to fall through to Date.now() — making every order
+// look 0 seconds old forever: auto-decline never fired (nothing looked stale)
+// and time matching saw a garbage anchor. Accept Timestamps, epoch ms/s
+// numbers, and ISO strings; only truly missing values fall back to now.
+function createdMsOf(data) {
+  const c = data && data.createdAt
+  if (c && typeof c.toMillis === 'function') return c.toMillis()
+  if (typeof c === 'number' && Number.isFinite(c)) return c < 1e12 ? c * 1000 : c
+  if (typeof c === 'string') { const t = Date.parse(c); if (!isNaN(t)) return t }
+  return Date.now()
+}
 const naira = v => '₦' + Number(v || 0).toLocaleString('en-NG')
 
 /* ------------------------- approve matched request ------------------------ */
@@ -510,7 +528,7 @@ exports.handler = async (event) => {
         db.collection('bankAlerts').orderBy('createdAt', 'desc').limit(5).get(),
       ])
       const diag = {
-        ok: true, engine: 'v6.4', now: new Date().toISOString(), auth,
+        ok: true, engine: 'v6.5', now: new Date().toISOString(), auth,
         config, withdrawAutopilot: withdraw,
         pendingFndOrders: pendingFnd.size,
         samplePendingAmounts: pendingFnd.docs.map(d => Number(d.data().amount) || 0),
@@ -530,7 +548,7 @@ exports.handler = async (event) => {
     if (params.sweep === '1') {
       const withdrawals = await sweepWithdrawals()
       const stale = await autoDeclineStale()
-      return json(200, { ok: true, engine: 'v6.4', withdrawals, staleDeclined: stale })
+      return json(200, { ok: true, engine: 'v6.5', withdrawals, staleDeclined: stale })
     }
 
     /* ---- force approve (test tool): ?approve=AMOUNT&name=NAME ---- */
