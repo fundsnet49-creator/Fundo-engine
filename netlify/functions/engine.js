@@ -1,5 +1,5 @@
 /**
- * FUNDO Autopilot Engine — v6.6 (Netlify Function)
+ * FUNDO Autopilot Engine — v6.7 (Netlify Function)
  *
  * ONE endpoint does everything:  https://<your-site>.netlify.app/.netlify/functions/engine
  *
@@ -7,8 +7,36 @@
  *  GET  ?sweep=1                              → run withdrawal autopilot pass + stale-order cleanup
  *  GET  ?ping=1&key=HOOK_KEY                  → self-test / diagnostics (no writes)
  *  GET  ?approve=AMOUNT&name=NAME&key=KEY     → force-approve one pending order (test tool)
+ *  POST ?user=1  {action:'arm'|'paid', kind, orderId}  → USER endpoint (Firebase ID token,
+ *                                               Authorization: Bearer <idToken>).
+ *       'arm'  — the order sheet just opened: stamp armedAt, sweep stale orders,
+ *                then rescan the recent bank alerts for this order (the SMS may
+ *                have arrived before the sheet finished opening).
+ *       'paid' — the user clicked "I've made payment": stamp paidAt (starts the
+ *                paid-window for auto-decline) and rescan alerts immediately.
+ *       Both return the order's live status so the waiting sheet can flip to
+ *       awaiting / confirmed / declined without polling Firestore itself.
  *
- * Every call (except OPTIONS) needs the HOOK_KEY: header  x-autopilot-key: <key>  or ?key=<key>.
+ * Every call except OPTIONS and ?user=1 needs the HOOK_KEY: header x-autopilot-key or ?key=.
+ *
+ * v6.7 changes vs v6.6 — order-triggered autopilot (THE "autopilot never fires" rebuild):
+ *  - The autopilot is now ARMED by the order itself. Creating an order and clicking
+ *    "I've made payment" both call ?user=1, which (a) stamps armedAt/paidAt, (b) runs
+ *    the stale sweep so expiry declines no longer depend on the phone's sweep timer,
+ *    and (c) immediately re-runs the matcher against the last 35 minutes of bank
+ *    alerts — a payment that landed seconds before the sheet opened now confirms
+ *    instantly instead of waiting for another SMS to nudge the engine.
+ *  - MATCH BY ORDER REMARK: orders now carry a unique ref (FND-XXXX / UPG-XXXX /
+ *    VRF-XXXX) that the buyer puts in the transfer narration. An alert whose text
+ *    contains the order's ref (case-insensitive) AND matches the amount within
+ *    ₦100 is conclusive — approved regardless of name/time evidence, and ranked
+ *    ahead of every other candidate.
+ *  - PAID-WINDOW EXPIRY: auto-decline now measures from paidAt when present (the
+ *    user clicked "I've made payment"), else createdAt. Countdown hit 00:00 with
+ *    no matching alert → the engine declines the order and notifies the user.
+ *  - Verify approvals now store the linked bank account on the user doc
+ *    (linkedAccount{bankName,accountNumber}) — the account the deposit came from
+ *    is the account that gets verified, as the verify page promises.
  *
  * v6.6 changes vs v6.5 — the silent-500 fix (THE "only decline works" cause):
  *  - approveMatch filtered status+amount AND sorted by createdAt, which needs
@@ -259,9 +287,13 @@ async function logAction(kind, action, data, detail) {
 }
 
 function userNotif(uid, title, body, type) {
-  return db.collection('usernotifs').doc(uid).collection('items').add({
-    title, body, type, createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  }).catch(e => console.error('userNotif failed', e.message))
+  // Never let a notification failure 500 the webhook AFTER money moved — the
+  // whole point of the catch around everything, including argument building.
+  try {
+    return db.collection('usernotifs').doc(uid).collection('items').add({
+      title, body, type, createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    }).catch(e => console.error('userNotif failed', e.message))
+  } catch (e) { console.error('userNotif failed', e.message) }
 }
 
 // The user app writes createdAt as a plain epoch NUMBER (not a Firestore
@@ -281,7 +313,7 @@ const naira = v => '₦' + Number(v || 0).toLocaleString('en-NG')
 /* ------------------------- approve matched request ------------------------ */
 
 async function approveMatch(alert, options = {}) {
-  const { force = false, debug = [] } = options
+  const { force = false, debug = [], onlyOrderId = null } = options
   const config = await getAutopilotConfig()
   const now = Date.now()
 
@@ -326,8 +358,14 @@ async function approveMatch(alert, options = {}) {
 
     const candidates = []
     for (const doc of pendingSnap.docs) {
+      if (onlyOrderId && doc.id !== onlyOrderId) continue
       const data = doc.data()
       const createdMs = createdMsOf(data)
+      // v6.7 — conclusive match: the buyer wrote the order's unique ref into the
+      // transfer narration and the alert text contains it, with the amount right.
+      // (tolerance ₦100 — some banks append narration codes into the parsed figure)
+      const refHit = Boolean(data.ref && alert.text)
+        && alert.text.toUpperCase().includes(String(data.ref).toUpperCase())
       const selfName = data.ref || data.note || ''
       const nmSelf = Boolean(alert.name) && nameMatches(alert.name, selfName)
       let nmProfile = false, nmLinked = false
@@ -356,21 +394,31 @@ async function approveMatch(alert, options = {}) {
         debug.push(`${kind}: order ${data.ref || data.note || data.uid} | amount differs by ${naira(diff)} — beyond ${naira(feeTol)} fee tolerance, skipped`)
         continue
       }
+      // v6.7 — a ref+narration hit with the amount right IS the payment; the alert
+      // arriving is already the time evidence. Loose the strict timeOk for it.
+      const refAmountOk = diff <= 100
       // In rescue mode a name match + time window is mandatory (amount is unreliable).
-      let via = nmSelf ? 'sender name from order'
+      let via = refHit && refAmountOk ? 'order remark in alert text'
+        : nmSelf ? 'sender name from order'
         : nmLinked ? 'receiver name = linked account'
         : nmProfile ? 'sender name = account name'
         : timeOk && exactAmount ? 'amount+time'
         : !exactAmount && anyName && timeOk ? 'name+time' : null
-      if (!exactAmount && via) via = `${via} (amount differs by ${naira(diff)}, within ${naira(feeTol)} fee tolerance)`
-      debug.push(`${kind}: order ${data.ref || data.note || data.uid} | sender=${nmSelf ? 'MATCH' : 'no'} | receiver-linked=${nmLinked ? 'MATCH' : 'no'} | profile=${nmProfile ? 'MATCH' : 'no'} | when-vs-arrival=${timediff === null ? 'n/a' : Math.round(timediff / 1000) + 's'} | orderAge=${Math.round((now - createdMs) / 1000) + 's'} | timeOk=${timeOk}`)
+      if (refHit && !refAmountOk) {
+        debug.push(`${kind}: order ${data.ref} | remark found in alert but amount differs by ${naira(diff)} — NOT approving`)
+        via = null
+      }
+      if (!exactAmount && via && !via.startsWith('order remark')) via = `${via} (amount differs by ${naira(diff)}, within ${naira(feeTol)} fee tolerance)`
+      debug.push(`${kind}: order ${data.ref || data.note || data.uid} | remark=${refHit ? 'MATCH' : 'no'} | sender=${nmSelf ? 'MATCH' : 'no'} | receiver-linked=${nmLinked ? 'MATCH' : 'no'} | profile=${nmProfile ? 'MATCH' : 'no'} | when-vs-arrival=${timediff === null ? 'n/a' : Math.round(timediff / 1000) + 's'} | orderAge=${Math.round((now - createdMs) / 1000) + 's'} | timeOk=${timeOk}`)
       if (!via && !(force && !alert.name)) continue // no clue matched — leave it for the next alert
       // force approve with no name: take the oldest pending of this amount regardless of time
-      candidates.push({ doc, data, via })
+      candidates.push({ doc, data, via, refHit: refHit && refAmountOk })
     }
     if (!candidates.length) continue
+    // refHit matches are conclusive — they jump the queue ahead of name/time guesses
+    candidates.sort((a, b) => (b.refHit ? 1 : 0) - (a.refHit ? 1 : 0))
     // rescue mode: among the name-matched orders pick the amount closest to the alert
-    const pick = exactAmount
+    const pick = (candidates[0].refHit || exactAmount)
       ? candidates[0]
       : candidates.reduce((a, b) => Math.abs((Number(a.data.amount) || 0) - alert.amount) <= Math.abs((Number(b.data.amount) || 0) - alert.amount) ? a : b)
 
@@ -389,7 +437,18 @@ async function approveMatch(alert, options = {}) {
           if (kind === 'fnd') {
             tx.update(userRef, { fndBalance: admin.firestore.FieldValue.increment(Number(data.fnd) || 0) })
           } else if (kind === 'verify') {
-            tx.update(userRef, { bankVerified: true, balance: admin.firestore.FieldValue.increment(Number(data.amount) - VERIFY_CHARGE) })
+            // v6.7 — link the account the deposit came FROM, as the verify page
+            // promises: "the system will link and verify only the account used
+            // for the payment".
+            tx.update(userRef, {
+              bankVerified: true,
+              balance: admin.firestore.FieldValue.increment(Number(data.amount) - VERIFY_CHARGE),
+              linkedAccount: {
+                bankName: data.bankName || '',
+                accountNumber: data.bankNumber || '',
+                verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+            })
           } else if (kind === 'upgrade') {
             // Plan duration: stamp when the paid plan lapses. Read the plan
             // doc's durationMonths (1/2/3 months, or 0/absent = lifetime) and
@@ -487,7 +546,11 @@ async function autoDeclineStale() {
     const stale = await db.collection(meta.collection).where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(20).get()
     for (const doc of stale.docs) {
       const data = doc.data()
-      if (now - createdMsOf(data) < windowMs) continue
+      // v6.7 — the paid window starts when the user clicked "I've made payment"
+      // (paidAt, stamped by the ?user=1 endpoint), not at order creation.
+      const paidMs = data.paidAt && typeof data.paidAt.toMillis === 'function' ? data.paidAt.toMillis() : 0
+      const deadline = paidMs || createdMsOf(data)
+      if (now - deadline < windowMs) continue
       const userRef = db.collection('users').doc(data.uid)
       try {
         await db.runTransaction(async tx => {
@@ -514,6 +577,53 @@ async function autoDeclineStale() {
   return summary
 }
 
+/* --------------------- user endpoint: arm / paid (v6.7) -------------------
+ * Called by the payment sheet the moment an order is created ('arm') and again
+ * when the buyer clicks "I've made payment" ('paid'). Authenticated with the
+ * user's Firebase ID token — never the HOOK_KEY, so a leaked key still can't
+ * arm or release anybody's order.
+ */
+async function armOrder(kind, orderId, uid, paid, debug = []) {
+  const meta = KINDS[kind]
+  if (!meta) return { ok: false, error: 'unknown kind' }
+  const ref = db.collection(meta.collection).doc(orderId)
+  const snap = await ref.get()
+  if (!snap.exists) return { ok: false, error: 'order not found' }
+  const data = snap.data()
+  if (data.uid !== uid) return { ok: false, error: 'not your order' }
+  if (data.status !== 'pending') return { ok: true, status: data.status }
+
+  const patch = { armedAt: admin.firestore.FieldValue.serverTimestamp() }
+  if (paid) patch.paidAt = admin.firestore.FieldValue.serverTimestamp()
+  await ref.update(patch) // Admin SDK bypasses rules; owner-only fields untouched
+
+  // Housekeeping first: an expired sibling order must not block this match,
+  // and this order itself must be declined if its paid window already ran out.
+  await autoDeclineStale()
+
+  // Rescan recent alerts for THIS order — the SMS may have arrived before the
+  // sheet finished opening or before the phone forwarded it.
+  const cutoff = new Date(Date.now() - 35 * 60 * 1000)
+  const alerts = await db.collection('bankAlerts').where('createdAt', '>=', cutoff).orderBy('createdAt', 'desc').limit(15).get()
+  let matched = null
+  for (const d of alerts.docs) {
+    const a = d.data()
+    const alert = { amount: Number(a.amount) || 0, name: a.name || '', receiver: a.receiver || '', whenMs: Number(a.whenMs) || 0, text: a.text || '' }
+    matched = await approveMatch(alert, { onlyOrderId: orderId, debug })
+    if (matched) break
+  }
+  const fresh = await ref.get()
+  const status = fresh.exists ? fresh.data().status : 'gone'
+  return { ok: true, status, matched: matched ? { kind: matched.kind, via: matched.via } : null }
+}
+
+async function verifyIdTokenFromEvent(headers) {
+  const h = headers.authorization || headers.Authorization || ''
+  const m = /^Bearer\s+(.+)$/i.exec(String(h).trim())
+  if (!m) return null
+  try { return await admin.auth().verifyIdToken(m[1]) } catch (e) { return null }
+}
+
 /* ------------------------------- handler ---------------------------------- */
 
 exports.handler = async (event) => {
@@ -522,7 +632,7 @@ exports.handler = async (event) => {
     headers: {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type, x-autopilot-key',
+      'Access-Control-Allow-Headers': 'Content-Type, x-autopilot-key, Authorization',
       'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
     },
     body: JSON.stringify(obj),
@@ -534,6 +644,25 @@ exports.handler = async (event) => {
   console.log('ENGINE HIT', event.httpMethod, 'sweep=' + (params.sweep || '0'), 'ping=' + (params.ping || '0'), 'authMatched=' + auth.authMatched)
 
   if (event.httpMethod === 'OPTIONS') return json(200, { ok: true })
+
+  /* ---- v6.7 user endpoint: POST ?user=1 {action:'arm'|'paid', kind, orderId}
+         Authenticated with the buyer's Firebase ID token. Runs BEFORE the
+         HOOK_KEY gate — users don't have the hook key. */
+  if (event.httpMethod === 'POST' && params.user === '1') {
+    try {
+      const decoded = await verifyIdTokenFromEvent(headers)
+      if (!decoded) return json(401, { ok: false, error: 'unauthorised — send Authorization: Bearer <idToken>' })
+      let body = {}
+      try { body = JSON.parse(event.body || '{}') } catch (e) { return json(400, { ok: false, error: 'body is not valid JSON' }) }
+      const action = body.action === 'paid' ? 'paid' : 'arm'
+      const result = await armOrder(String(body.kind || ''), String(body.orderId || ''), decoded.uid, action === 'paid')
+      return json(200, { ok: result.ok !== false, engine: 'v6.7', action, ...result })
+    } catch (e) {
+      console.error('USER ENDPOINT ERROR', e)
+      return json(500, { ok: false, error: e.message })
+    }
+  }
+
   if (!auth.authMatched) return json(401, { ok: false, error: 'unauthorised — HOOK_KEY mismatch', auth })
 
   try {
@@ -547,7 +676,7 @@ exports.handler = async (event) => {
         db.doc('settings/engineStatus').get(),
       ])
       const diag = {
-        ok: true, engine: 'v6.6', now: new Date().toISOString(), auth,
+        ok: true, engine: 'v6.7', now: new Date().toISOString(), auth,
         config, withdrawAutopilot: withdraw,
         pendingFndOrders: pendingFnd.size,
         samplePendingAmounts: pendingFnd.docs.map(d => Number(d.data().amount) || 0),
@@ -568,7 +697,7 @@ exports.handler = async (event) => {
     if (params.sweep === '1') {
       const withdrawals = await sweepWithdrawals()
       const stale = await autoDeclineStale()
-      return json(200, { ok: true, engine: 'v6.6', withdrawals, staleDeclined: stale })
+      return json(200, { ok: true, engine: 'v6.7', withdrawals, staleDeclined: stale })
     }
 
     /* ---- force approve (test tool): ?approve=AMOUNT&name=NAME ---- */
